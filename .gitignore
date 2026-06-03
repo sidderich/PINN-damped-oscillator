@@ -17,3 +17,9 @@ PINN/
 venv/
 env/
 .venv/
+
+# Model checkpoints
+model_checkpoints/
+
+# todo-liste nicht mit pushen
+todo-liste.txt

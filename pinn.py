@@ -1,161 +1,217 @@
+from xml.parsers.expat import model
+
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-import matplotlib.pyplot as plt
+
+import os
+
+if not os.path.exists("model_checkpoints"):
+    os.makedirs("model_checkpoints")
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# device = torch.device("cpu")
+print(f"Using device: {device}")
+torch.set_default_dtype(torch.float32)
 
-# --- Parameter ---
-m, c, k = 1.0, 0.4, 4.0
-lambda_physics = 2
-lambda_data = 5.0
-lambda_ic = 6
-
-# --- Netzwerk ---
-neurons = 64
-np.random.seed(42)
-torch.manual_seed(42)
-
-class PINN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(1, neurons), nn.Tanh(),
-            nn.Linear(neurons, neurons), nn.Tanh(),
-            nn.Linear(neurons, 1)
-        )
-    
-    def forward(self, t):
-        return self.net(t)
-
-c_train = torch.nn.Parameter(torch.tensor([c*0.85]), requires_grad=True).to(device)
-k_train = torch.nn.Parameter(torch.tensor([k*1.3]), requires_grad=True).to(device)
-model = PINN().to(device)
-
-optimizer = torch.optim.Adam(
-    [{"params": model.parameters()},
-     {"params": [c_train, k_train], "lr": 1e-4}],
-     lr=1e-3
-    )
 
 class ODEData:
-    def __init__(self, t, x):
-        self.t = t
-        self.x = x
+    def __init__(self, m, c, k, t_start, t_end, n_points, x0, noise=0.1):
+        self.m = m
+        self.c = c
+        self.k = k
+        self.t_start = t_start
+        self.t_end = t_end
+        self.n_points = n_points
+        self.x0 = x0
+        self.noise = noise
 
-        result = self.solver((t[0], t[-1]), x)
-        self.solution = result[0]
-        self.velocity = result[1]
+        self.t = self._generate_time()
 
-    def solver(self, t_span, x0):
+        if self.noise is None or self.noise == 0:
+            self.solution, self.velocity = self._solve_ode()
+        else:
+            self.solution, self.velocity = self._add_noise(self._solve_ode())
+
+
+    def _generate_time(self):
+        return np.linspace(self.t_start, self.t_end, self.n_points)
+
+    def _solve_ode(self):
         from scipy.integrate import solve_ivp
+
         def ode(t, x):
             y1, y2 = x
             dy1_dt = y2
-            dy2_dt = -(c*y2 + k*y1) / m
+            dy2_dt = -(self.c * y2 + self.k * y1) / self.m
             return [dy1_dt, dy2_dt]
-        sol = solve_ivp(ode, t_span, x0, t_eval=self.t)
+
+        sol = solve_ivp(ode, (self.t_start, self.t_end), self.x0, t_eval=self.t)
         return sol.y
-    
-if __name__ == "__main__":
-    
-    # 1. Referenzlösung generieren
-    time = np.linspace(0, 10, 500)
-    x0 = [1.0, 0.0]  # Anfangsbedingungen
-    data = ODEData(t = time, x = x0)
-   
-    # 2. Physics Loss implementieren
-    reference = torch.tensor(data.solution, dtype=torch.float32).unsqueeze(1).to(device)
 
-    # scheduler
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, 
-        step_size=2000, 
-        gamma=0.8
+    def _add_noise(self, x):
+        if self.noise is not None:
+            return x + np.random.normal(0, self.noise, size=x.shape)
+        else:
+            return x
+
+
+class PINN(nn.Module):
+    def __init__(self, neurons=64, m=1.0, c_init=0.34, k_init=5.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, neurons),
+            nn.Tanh(),
+            nn.Linear(neurons, neurons),
+            nn.Tanh(),
+            nn.Linear(neurons, 1),
         )
+        self.m = m
+        self.c_train = torch.nn.Parameter(torch.tensor([c_init]), requires_grad=True)
+        self.k_train = torch.nn.Parameter(torch.tensor([k_init]), requires_grad=True)
 
-    # sammeln der trainigs iterationen
-    c_history = []
-    k_history = []
+    def forward(self, t):
+        return self.net(t)
 
-    # Training Loop
-    for epoch in range(50000):
+    def derivatives(self, t):
+        x = self(t)
+        x_t = torch.autograd.grad(outputs=x, inputs=t, grad_outputs=torch.ones_like(x), create_graph=True)[0]
+        x_tt = torch.autograd.grad(outputs=x_t, inputs=t, grad_outputs=torch.ones_like(x_t), create_graph=True)[0]
+        return x, x_t, x_tt
+
+    def physics_residual(self, t):
+        x, x_t, x_tt = self.derivatives(t)
+        return self.m * x_tt + self.c_train * x_t + self.k_train * x
+
+
+def train_pinn(
+    model,
+    data,
+    epochs=50000,
+    lr_model=1e-3,
+    lr_phys_params=1e-4,
+    lambda_physics=2.0,
+    lambda_data=5.0,
+    lambda_ic=6.0,
+):
+    time = torch.tensor(data.t, dtype=torch.float32, device=device).unsqueeze(1)
+    time.requires_grad_(True)
+
+    reference = torch.tensor(
+        data.solution, dtype=torch.float32, device=device
+    ).unsqueeze(1)
+    t0 = torch.tensor([[0.0]], dtype=torch.float32, device=device)
+    v0 = torch.tensor(data.velocity[0], dtype=torch.float32, device=device)
+
+    optimizer = torch.optim.Adam(
+        [
+            {"params": model.net.parameters(), "lr": lr_model},
+            {"params": [model.c_train, model.k_train], "lr": lr_phys_params},
+        ]
+    )
+
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.8)
+
+    history = {"c": [], "k": [], "loss": [], "physics": [], "data": [], "ic": []}
+
+    for epoch in range(epochs):
         optimizer.zero_grad()
-        # time wird hier als torch tensor neu definiert 
-        time = torch.linspace(0,10,500).unsqueeze(1).to(device)
-        time.requires_grad_(True)
-
-        x = model(time)
-        x_t = torch.autograd.grad(
-            outputs = x,
-            inputs = time,
-            grad_outputs = torch.ones_like(x),
-            create_graph = True
-        )
-        x_tt = torch.autograd.grad(
-            outputs = x_t[0],
-            inputs = time,
-            grad_outputs = torch.ones_like(x_t[0]),
-            create_graph = True
-        ) 
-        # Anfangsbedingungen
-        t0 = torch.tensor([[0.0]], requires_grad=True).to(device)
-        x0_pred = model(t0)
-        x_t0 = torch.autograd.grad(
-            outputs = x0_pred,
-            inputs = t0,
-            grad_outputs = torch.ones_like(x0_pred),
-            create_graph = True
-        )
-        v0 = torch.tensor(data.velocity[0], dtype=torch.float32).to(device)
-
+        t0.requires_grad_(True)
         
-        # ODE-Residuum    
-        residuum = m*x_tt[0] + c_train*x_t[0] + k_train*x
-        physics_loss = torch.mean(residuum**2)
+        x, x_t, x_tt = model.derivatives(time)
+        x0_pred, x_t0, _ = model.derivatives(t0)
 
-        # Data Loss
-        data_loss = torch.mean((x - reference)**2)
+        physics_residual = model.m * x_tt + model.c_train * x_t + model.k_train * x
+        physics_loss = torch.mean(physics_residual ** 2)
 
-        # IC Loss
-        ic_loss = (x0_pred - 1)**2 + (x_t0[0] - v0)**2
-
-        if epoch % 1000 == 0:
-            print(f'Epoch {epoch}, Physics Loss: {physics_loss.item():.4f}, Data Loss: {data_loss.item():.4f}, IC Loss: {ic_loss.item():.4f}, Learning Rate: {optimizer.param_groups[0]["lr"]*100:.6f}%, c: {c_train.item():.4f}, k: {k_train.item():.4f}')  
-
-        # Gesamtverlust mit Gewichtung
-        loss = lambda_physics * physics_loss + lambda_data * data_loss + lambda_ic * ic_loss
+        data_loss = torch.mean((x - reference) ** 2)
+        ic_loss = (x0_pred - 1) ** 2 + (x_t0[0] - v0) ** 2
+        loss = (
+            lambda_physics * physics_loss
+            + lambda_data * data_loss
+            + lambda_ic * ic_loss
+        )
 
         loss.backward()
         optimizer.step()
         scheduler.step()
 
-        c_history.append(c_train.item())
-        k_history.append(k_train.item())
-        
+        if epoch % 100 == 0:
+            history["c"].append(model.c_train.item())
+            history["k"].append(model.k_train.item())
+            history["loss"].append(loss.item())
+            history["physics"].append(physics_loss.item())
+            history["data"].append(data_loss.item())
+            history["ic"].append(ic_loss.item())
 
-    print(f'Optimierte Parameter: c = {c_train.item():.4f}, k = {k_train.item():.4f}')
-    # Beide Ergebnisse in einem Plot vergleichen. 
-    # Linker subplot: Referenzlösung vs. Vorhersage des PINN
-    # Rechter subplot: Verlauf der Parameter c und k über die Epochen
-    fig, (ax1, ax2) = plt.subplots(1, 2,
-        figsize=(12, 5),
-        dpi=450
-    )
+        if epoch % 5000 == 0:
+            print(
+                f"Epoch {epoch}, Physics Loss: {physics_loss.item():.4f}, "
+                f"Data Loss: {data_loss.item():.4f}, IC Loss: {ic_loss.item():.4f}, "
+                f"Learning Rate: {optimizer.param_groups[0]['lr'] * 100:.6f}%, "
+                f"c: {model.c_train.item():.4f}, k: {model.k_train.item():.4f}"
+            )
+
+    return model, history, time, x.detach()
+
+
+def plot_results(data, prediction, history, filename="results.png"):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), dpi=450)
     # Linker subplot
-    ax1.plot(data.t, data.solution, label='Reference Data', color='blue')
-    ax1.plot(time.detach().numpy(), x.detach().numpy(), label='PINN Prediction', color='orange', linestyle='dashed')
-    ax1.set_title('Reference Data vs. PINN Prediction')
-    ax1.set_xlabel('Time (s)')
-    ax1.set_ylabel('Extension (m)')
+    ax1.plot(data.t, data.solution, label="Reference Data", color="blue")
+    ax1.plot(
+        data.t, prediction, label="PINN Prediction", color="orange", linestyle="dashed"
+    )
+    ax1.set_title("Reference Data vs. PINN Prediction")
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel("Extension (m)")
     ax1.legend()
     # Rechter subplot
-    ax2.plot(c_history, label='c', color='red')
-    ax2.plot(k_history, label='k', color='green')
-    ax2.set_title('Parameter values over epochs')
-    ax2.set_xlabel('Epochs')
-    ax2.set_ylabel('Parameter Value')
+    ax2.plot(history["c"], label="c", color="red")
+    ax2.plot(history["k"], label="k", color="green")
+    ax2.set_title("Parameter values over epochs")
+    ax2.set_xlabel("Epochs")
+    ax2.set_ylabel("Parameter Value")
     ax2.legend()
-    plt.savefig('results.png', dpi=450, bbox_inches='tight')
-    
+
+    plt.savefig(filename, dpi=450, bbox_inches="tight")
+
+
+def main(noise, filename):
+    np.random.seed(42)
+    torch.manual_seed(42)
+
+    data = ODEData(
+        m=1.0,
+        c=0.4,
+        k=4.0,
+        t_start=0,
+        t_end=10,
+        n_points=1000,
+        x0=[1.0, 0.0],
+        noise=noise,
+    )
+
+    model = PINN(neurons=128, m=data.m, c_init=data.c * 0.85, k_init=data.k * 1.3).to(device)
+
+    model, history, _, prediction = train_pinn(model, data, epochs=50000)
+
+    # Save the model checkpoint including the optimized parameters
+    torch.save({
+    "model_state_dict": model.state_dict(),
+    "c": model.c_train.detach().cpu(),
+    "k": model.k_train.detach().cpu(),
+    }, f"model_checkpoints/pinn_checkpoint_{filename.split('.')[0]}.pth")
+
+    print(
+        f"Optimized parameters: c = {model.c_train.item():.4f}, k = {model.k_train.item():.4f}"
+    )
+    plot_results(data, prediction.cpu().numpy(), history, filename=filename)
+
+
+if __name__ == "__main__":
+    main(noise = 0, filename="results_no_noise.png")
+    main(noise= 0.05, filename="results_with_05_noise.png")
+    main(noise = 0.1, filename="results_with_noise.png")
