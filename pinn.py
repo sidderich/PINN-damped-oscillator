@@ -212,6 +212,6 @@ def main(noise, filename):
 
 
 if __name__ == "__main__":
-    main(noise = 0, filename="results_no_noise.png")
-    main(noise= 0.05, filename="results_with_05_noise.png")
-    main(noise = 0.1, filename="results_with_noise.png")
+    main(noise = 0, filename="results.png")
+    # main(noise= 0.05, filename="results_with_05_noise.png")
+    # main(noise = 0.1, filename="results_with_noise.png")

@@ -14,12 +14,12 @@ Given reference observations, the network simultaneously:
 
 ## Results
 
-The network recovers the parameters from initial guesses $c=0.34$, $k=5.2$:
+The network recovers the parameters from initial guesses $c_{\mathrm{init}}= c \cdot 0.85 $, $k_{\mathrm{init}}= k \cdot 1.3$:
 
 | Parameter | True value | Identified |
 |-----------|-----------|------------|
-| c         | 0.4       | 0.4472      |
-| k         | 4.0       | 4.3126      |
+| c         | 0.4       | 0.4498      |
+| k         | 4.0       | 4.3214      |
 
 ![results](results.png)
 
