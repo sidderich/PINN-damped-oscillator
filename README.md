@@ -18,8 +18,8 @@ The network recovers the parameters from initial guesses $c_{\mathrm{init}}= c \
 
 | Parameter | True value | Identified |
 |-----------|-----------|------------|
-| c         | 0.4       | 0.4498      |
-| k         | 4.0       | 4.3214      |
+| c         | 0.4       | 0.4020      |
+| k         | 4.0       | 3.9988      |
 
 ![results](results.png)
 

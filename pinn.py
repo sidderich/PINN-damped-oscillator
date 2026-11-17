@@ -17,6 +17,7 @@ print(f"Using device: {device}")
 torch.set_default_dtype(torch.float32)
 
 
+
 class ODEData:
     def __init__(self, m, c, k, t_start, t_end, n_points, x0, noise=0.1):
         self.m = m
@@ -95,6 +96,7 @@ def train_pinn(
     lambda_physics=2.0,
     lambda_data=5.0,
     lambda_ic=6.0,
+    batch_size=None,
 ):
     time = torch.tensor(data.t, dtype=torch.float32, device=device).unsqueeze(1)
     time.requires_grad_(True)
@@ -112,21 +114,36 @@ def train_pinn(
         ]
     )
 
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.8)
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.8)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=[
+            lambda epoch: 0.9 ** (epoch/2000),
+            lambda epoch: 1.0,
+        ],
+    )
 
     history = {"c": [], "k": [], "loss": [], "physics": [], "data": [], "ic": []}
+
+    n_points = time.shape[0]
+    if batch_size is not None:
+        batch_size = min(batch_size, n_points)
 
     for epoch in range(epochs):
         optimizer.zero_grad()
         t0.requires_grad_(True)
-        
+
         x, x_t, x_tt = model.derivatives(time)
         x0_pred, x_t0, _ = model.derivatives(t0)
 
         physics_residual = model.m * x_tt + model.c_train * x_t + model.k_train * x
         physics_loss = torch.mean(physics_residual ** 2)
 
-        data_loss = torch.mean((x - reference) ** 2)
+        if batch_size is None:
+            data_loss = torch.mean((x - reference) ** 2)
+        else:
+            idx = torch.randperm(n_points, device=device)[:batch_size]
+            data_loss = torch.mean((x[idx] - reference[idx]) ** 2)
         ic_loss = (x0_pred - 1) ** 2 + (x_t0[0] - v0) ** 2
         loss = (
             lambda_physics * physics_loss
@@ -154,7 +171,9 @@ def train_pinn(
                 f"c: {model.c_train.item():.4f}, k: {model.k_train.item():.4f}"
             )
 
-    return model, history, time, x.detach()
+    with torch.no_grad():
+        prediction = model(time)
+    return model, history, time, prediction.detach()
 
 
 def plot_results(data, prediction, history, filename="results.png"):
@@ -196,7 +215,7 @@ def main(noise, filename):
 
     model = PINN(neurons=128, m=data.m, c_init=data.c * 0.85, k_init=data.k * 1.3).to(device)
 
-    model, history, _, prediction = train_pinn(model, data, epochs=50000)
+    model, history, _, prediction = train_pinn(model, data, epochs=50000, batch_size=256)
 
     # Save the model checkpoint including the optimized parameters
     torch.save({
